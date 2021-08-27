@@ -77,6 +77,7 @@ const (
 	trackerLength    = 8
 	protocolICMP     = 1
 	protocolIPv6ICMP = 58
+	maxPacketTimeout = time.Duration(math.MaxInt64)
 )
 
 var (
@@ -88,22 +89,23 @@ var (
 func New(addr string) *Pinger {
 	r := rand.New(rand.NewSource(getSeed()))
 	return &Pinger{
-		Count:      -1,
-		Interval:   time.Second,
-		RecordRtts: true,
-		Size:       timeSliceLength + trackerLength,
-		Timeout:    time.Duration(math.MaxInt64),
-		Tracker:    r.Uint64(),
+		Count:         -1,
+		Interval:      time.Second,
+		RecordRtts:    true,
+		Size:          timeSliceLength + trackerLength,
+		Timeout:       time.Duration(math.MaxInt64),
+		PacketTimeout: time.Duration(math.MaxInt64),
+		Tracker:       r.Uint64(),
 
-		addr:              addr,
-		done:              make(chan interface{}),
-		id:                r.Intn(math.MaxUint16),
-		ipaddr:            nil,
-		ipv4:              false,
-		network:           "ip",
-		protocol:          "udp",
-		awaitingSequences: map[int]struct{}{},
-		logger:            StdLogger{Logger: log.New(log.Writer(), log.Prefix(), log.Flags())},
+		addr:            addr,
+		done:            make(chan interface{}),
+		id:              r.Intn(math.MaxUint16),
+		ipaddr:          nil,
+		ipv4:            false,
+		network:         "ip",
+		protocol:        "udp",
+		InFlightPackets: map[int]InFlightPacket{},
+		logger:          StdLogger{Logger: log.New(log.Writer(), log.Prefix(), log.Flags())},
 	}
 }
 
@@ -121,6 +123,10 @@ type Pinger struct {
 	// Timeout specifies a timeout before ping exits, regardless of how many
 	// packets have been received.
 	Timeout time.Duration
+
+	// PacketTimeout specifies a timeout before the OnTimeout function is called
+	// for a packet not being received
+	PacketTimeout time.Duration
 
 	// Count tells pinger to stop after sending (and receiving) Count echo
 	// packets. If this option is not specified, pinger will operate until
@@ -166,6 +172,9 @@ type Pinger struct {
 	// OnFinish is called when Pinger exits
 	OnFinish func(*Statistics)
 
+	// OnTimeout is called when packet timeout
+	OnTimeout func(int, *InFlightPacket)
+
 	// OnDuplicateRecv is called when a packet is received that has already been received.
 	OnDuplicateRecv func(*Packet)
 
@@ -188,14 +197,18 @@ type Pinger struct {
 	ipv4     bool
 	id       int
 	sequence int
-	// awaitingSequences are in-flight sequence numbers we keep track of to help remove duplicate receipts
-	awaitingSequences map[int]struct{}
+	// InFlightPackets is used to keep track of in-flight packets for the purposes of determining timeouts and duplicates
+	InFlightPackets map[int]InFlightPacket
 	// network is one of "ip", "ip4", or "ip6".
 	network string
 	// protocol is "icmp" or "udp".
 	protocol string
 
 	logger Logger
+}
+
+type InFlightPacket struct {
+	DispatchedTime time.Time
 }
 
 type packet struct {
@@ -451,6 +464,7 @@ func (p *Pinger) runLoop(
 			return nil
 
 		case <-timeout.C:
+			p.CheckInFlightPackets()
 			return nil
 
 		case r := <-recvCh:
@@ -461,11 +475,13 @@ func (p *Pinger) runLoop(
 			}
 
 		case <-interval.C:
+			p.CheckInFlightPackets()
 			if p.Count > 0 && p.PacketsSent >= p.Count {
 				interval.Stop()
 				continue
 			}
 			err := p.sendICMP(conn)
+
 			if err != nil {
 				// FIXME: this logs as FATAL but continues
 				logger.Fatalf("sending packet: %s", err)
@@ -473,6 +489,22 @@ func (p *Pinger) runLoop(
 		}
 		if p.Count > 0 && p.PacketsRecv >= p.Count {
 			return nil
+		}
+	}
+}
+
+func (p *Pinger) CheckInFlightPackets() {
+	// Loop through each item in map
+	if p.PacketTimeout == maxPacketTimeout {
+		return
+	}
+	currentTime := time.Now()
+	for seq, pkt := range p.InFlightPackets {
+		if pkt.DispatchedTime.Add(p.PacketTimeout).Before(currentTime) {
+			delete(p.InFlightPackets, seq)
+			if p.OnTimeout != nil {
+				p.OnTimeout(seq, &pkt)
+			}
 		}
 	}
 }
@@ -630,7 +662,7 @@ func (p *Pinger) processPacket(recv *packet) error {
 		inPkt.Rtt = receivedAt.Sub(timestamp)
 		inPkt.Seq = pkt.Seq
 		// If we've already received this sequence, ignore it.
-		if _, inflight := p.awaitingSequences[pkt.Seq]; !inflight {
+		if _, inflight := p.InFlightPackets[pkt.Seq]; !inflight {
 			p.PacketsRecvDuplicates++
 			if p.OnDuplicateRecv != nil {
 				p.OnDuplicateRecv(inPkt)
@@ -638,7 +670,7 @@ func (p *Pinger) processPacket(recv *packet) error {
 			return nil
 		}
 		// remove it from the list of sequences we're waiting for so we don't get duplicates.
-		delete(p.awaitingSequences, pkt.Seq)
+		delete(p.InFlightPackets, pkt.Seq)
 		p.updateStatistics(inPkt)
 	default:
 		// Very bad, not sure how this can happen
@@ -700,8 +732,10 @@ func (p *Pinger) sendICMP(conn packetConn) error {
 			}
 			handler(outPkt)
 		}
-		// mark this sequence as in-flight
-		p.awaitingSequences[p.sequence] = struct{}{}
+		// mark this packet as in-flight
+		p.InFlightPackets[p.sequence] = InFlightPacket{
+			DispatchedTime: time.Now(),
+		}
 		p.PacketsSent++
 		p.sequence++
 		break
